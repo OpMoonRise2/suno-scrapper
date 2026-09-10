@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         Suno Workspace Downloader
 // @namespace    https://github.com/OpMoonRise2/suno-scrapper
-// @version      0.1.0
-// @description  Download the signed-in creator's currently loaded Suno tracks as MP3 or WAV.
+// @version      0.3.2
+// @description  Download the signed-in creator's currently loaded Suno tracks as MP3 or WAV, and classify authorization failures without circumventing them.
 // @author       OpMoonRise2
 // @match        https://suno.com/*
 // @run-at       document-start
+// @grant        unsafeWindow
+// @grant        GM_xmlhttpRequest
 // @grant        GM_download
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -19,16 +21,62 @@
 
   const APP_ID = 'suno-workspace-downloader';
   const BRIDGE_ID = `${APP_ID}:metadata`;
-  const SETTINGS_KEY = `${APP_ID}:settings-v1`;
+  const SETTINGS_KEY = `${APP_ID}:settings-v2`;
   const SONG_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
   const SONG_PATH_RE = /\/song\/([0-9a-f-]{36})(?:[/?#]|$)/i;
   const RETRY_DELAYS_MS = [0, 1000, 2500];
   const BETWEEN_DOWNLOADS_MS = 1200;
-  const OWNED_WORKSPACE_ROUTES = ['/me', '/create', '/studio'];
+  const OWNED_WORKSPACE_ROUTES = ['/me', '/create', '/studio', '/workspace', '/library'];
+  const MAX_CONSECUTIVE_DENIALS = 3;
   const DEFAULT_SETTINGS = {
     format: 'mp3',
     completed: {},
     destinationNoticeShown: false,
+  };
+
+  /**
+   * Failure categories describe *why* Suno refused an asset. Every category is
+   * diagnostic: none of them causes the script to rewrite a request, replay a
+   * signed URL, alter a header, change a format parameter, or substitute one
+   * format for another. A refused asset is reported, never renegotiated.
+   */
+  const FAILURE_CATEGORIES = {
+    session_invalid: {
+      label: 'session rejected',
+      advice: 'Suno returned HTTP 401. Sign in again in this tab, reload, then rescan. The queue stops here.',
+    },
+    expired_url: {
+      label: 'expired media URL',
+      advice: 'Suno served this asset to this tab earlier, so the captured URL has most likely expired. Click Rescan to capture a fresh URL, then download again.',
+    },
+    not_entitled: {
+      label: 'not served to this account',
+      advice: 'Suno returned HTTP 403 and no earlier success for this asset was observed in this tab. Use Suno’s own Download dialog to confirm whether this track/format is available to you at all.',
+    },
+    rate_limited: {
+      label: 'rate limited',
+      advice: 'Suno returned HTTP 429. The queue backs off before the next track. The same refused request is not repeated.',
+    },
+    missing_asset: {
+      label: 'no asset exposed',
+      advice: 'Suno exposes no media URL for this format on this song. Open the song’s own Suno Download dialog for this format and retry.',
+    },
+    server_error: {
+      label: 'Suno server error',
+      advice: 'Temporary server-side failure. A bounded retry is allowed.',
+    },
+    not_audio: {
+      label: 'response was not audio',
+      advice: 'Suno returned a page, playlist, or error document instead of audio. Nothing was saved.',
+    },
+    network: {
+      label: 'network failure',
+      advice: 'The request never completed. A bounded retry is allowed.',
+    },
+    unknown: {
+      label: 'unclassified failure',
+      advice: 'Inspect the diagnostics record and report entry for this track.',
+    },
   };
 
   const trackMetadata = new Map();
@@ -39,12 +87,182 @@
     activeDownload: null,
     scanTimer: null,
     ui: null,
+    signedInHandle: null,
+    // Song IDs Suno itself served to this tab during this page session. Used to
+    // separate "the URL I captured went stale" from "this account is not
+    // entitled", without ever re-requesting a denied asset to find out.
+    nativeMediaSuccess: new Set(),
+    // Songs whose captured URL was refused after a native success. They
+    // re-resolve through the page on the next user-initiated run.
+    staleMedia: new Set(),
+    findings: [],
   };
+
+
+  const diagnosticRecords = [];
+  function diagnosticUrl(value) {
+    try { const url = new URL(value, location.origin); return url.origin + url.pathname; }
+    catch (_) { return '(unknown URL)'; }
+  }
+  function diagnosticShape(value, depth = 0) {
+    if (depth > 3) return typeof value;
+    if (Array.isArray(value)) return { count: value.length, sample: diagnosticShape(value[0], depth + 1) };
+    if (!value || typeof value !== 'object') return typeof value;
+    const result = {};
+    for (const key of Object.keys(value).slice(0, 40)) {
+      if (/token|cookie|authorization|secret|password|email|prompt|lyrics/i.test(key)) continue;
+      const item = value[key];
+      if (/^(id|clip_id|song_id|clip_ids|song_ids|format|file_type|type|status|is_unlocked|downloadable|can_download|is_downloaded)$/.test(key)) {
+        if (Array.isArray(item)) result[key] = item.filter(x => typeof x === 'string' && SONG_ID_RE.test(x)).slice(0, 20);
+        else if (typeof item === 'boolean' || typeof item === 'number' || (typeof item === 'string' && (SONG_ID_RE.test(item) || /^(mp3|wav|m4a|mp4|complete|pending|error|success)$/i.test(item)))) result[key] = item;
+        else result[key] = typeof item;
+      } else if (/url/i.test(key) && typeof item === 'string') result[key] = diagnosticUrl(item);
+      else result[key] = diagnosticShape(item, depth + 1);
+    }
+    return result;
+  }
+  function recordDiagnostic(record) {
+    diagnosticRecords.push({ time: new Date().toISOString(), ...record });
+    if (diagnosticRecords.length > 80) diagnosticRecords.shift();
+    noteNativeMediaSuccess(record);
+    if (runtime.ui?.diagnostics) runtime.ui.diagnostics.value = JSON.stringify(diagnosticRecords, null, 2);
+  }
+
+  /**
+   * Remembers assets Suno itself already served to this tab. This is evidence
+   * gathered by observing Suno's own requests. It is never used to replay or
+   * re-sign a URL, only to label a later refusal accurately.
+   */
+  function noteNativeMediaSuccess(record) {
+    if (record.status !== 200) return;
+    if (!/^Suno page (fetch|XHR)$/.test(record.source || '')) return;
+    if (!/audio|mpeg|wav|octet-stream/i.test(record.contentType || '')) return;
+    const id = String(record.url || '').match(SONG_ID_RE)?.[0];
+    if (id) runtime.nativeMediaSuccess.add(id.toLowerCase());
+  }
+
+  /**
+   * Maps a failure to a category. Diagnostic only: no category makes the script
+   * rewrite, replay, or renegotiate a request Suno already refused.
+   */
+  function classifyFailure(error) {
+    const status = Number(error?.status) || 0;
+    if (status === 401) return 'session_invalid';
+    if (status === 429) return 'rate_limited';
+    if (status === 403) {
+      return runtime.nativeMediaSuccess.has(String(error?.songId || '').toLowerCase())
+        ? 'expired_url' : 'not_entitled';
+    }
+    if (status === 404 || status === 410) return 'missing_asset';
+    if (status >= 500) return 'server_error';
+    if (/not (?:WAV|MP3) audio|no MP3 audio frame|too small|playlist/i.test(error?.message || '')) return 'not_audio';
+    if (status) return 'unknown';
+    if (/timed out|network|failed/i.test(error?.message || '')) return 'network';
+    return 'unknown';
+  }
+
+  function recordFinding(track, format, category, error) {
+    const info = FAILURE_CATEGORIES[category] || FAILURE_CATEGORIES.unknown;
+    const songId = String(track?.songId || error?.songId || '');
+    runtime.findings.push({
+      time: new Date().toISOString(),
+      songId: songId.slice(0, 8),
+      title: String(track?.title || '').slice(0, 80),
+      format,
+      category,
+      status: Number(error?.status) || 0,
+      servedEarlierInThisTab: runtime.nativeMediaSuccess.has(songId.toLowerCase()),
+      reason: info.advice,
+    });
+    if (runtime.findings.length > 200) runtime.findings.shift();
+    if (category === 'expired_url') runtime.staleMedia.add(songId);
+    renderFindings();
+    renderReport();
+    return info;
+  }
+
+  /**
+   * Last guard on anything copied out of the panel: strips token-like material
+   * even if a future response field slips past diagnosticShape.
+   */
+  function scrubReport(text) {
+    return String(text)
+      .replace(/("?(?:authorization|cookie|set-cookie|x-api-key)"?\s*:\s*)"[^"]*"/gi, '$1"[redacted]"')
+      .replace(/(authorization|cookie|set-cookie|x-api-key|bearer)\s*[:=]\s*[^\s",}]+/gi, '$1: [redacted]')
+      .replace(/\b(token|signature|sig|expires|key|secret|password|session)=[^&\s"']+/gi, '$1=[redacted]');
+  }
+
+  function buildReport() {
+    const report = {
+      generated: new Date().toISOString(),
+      script: '0.3.2',
+      mode: 'diagnostic only — a refused asset is never retried, rewritten, re-signed, or substituted',
+      page: diagnosticUrl(location.href),
+      signedInProfile: runtime.signedInHandle,
+      format: runtime.ui?.format?.value || settings.format,
+      tracks: runtime.tracks.map((track) => ({
+        id: track.songId.slice(0, 8),
+        title: String(track.title || '').slice(0, 80),
+        mp3Observed: Boolean(track.mp3),
+        wavObserved: Boolean(track.wav),
+        servedEarlierInThisTab: runtime.nativeMediaSuccess.has(track.songId.toLowerCase()),
+      })),
+      findings: runtime.findings,
+      requests: diagnosticRecords,
+    };
+    return scrubReport(JSON.stringify(report, null, 2));
+  }
+
+  function renderReport() {
+    if (runtime.ui?.report) runtime.ui.report.value = buildReport();
+  }
+  function installDownloadDiagnostics() {
+    const page = typeof unsafeWindow === 'object' ? unsafeWindow : window;
+    const nativeFetch = page.fetch?.bind(page);
+    if (nativeFetch) page.fetch = async (...args) => {
+      const request = args[0];
+      const url = typeof request === 'string' ? request : request?.url;
+      const relevant = /download|unlock|audio|wav|mp3|cdn/i.test(diagnosticUrl(url));
+      const entry = { source: 'Suno page fetch', method: args[1]?.method || request?.method || 'GET', url: diagnosticUrl(url) };
+      if (relevant && typeof args[1]?.body === 'string') {
+        try { entry.request = diagnosticShape(JSON.parse(args[1].body)); } catch (_) { entry.request = '(non-JSON body omitted)'; }
+      }
+      try {
+        const response = await nativeFetch(...args);
+        if (relevant) {
+          entry.status = response.status;
+          entry.contentType = response.headers.get('content-type');
+          if (/json/i.test(entry.contentType || '')) {
+            response.clone().json().then(body => recordDiagnostic({ ...entry, response: diagnosticShape(body) })).catch(() => recordDiagnostic(entry));
+          } else recordDiagnostic(entry);
+        }
+        return response;
+      } catch (error) { if (relevant) recordDiagnostic({ ...entry, error: 'Network request rejected' }); throw error; }
+    };
+    const xhr = page.XMLHttpRequest?.prototype;
+    if (xhr) {
+      const open = xhr.open;
+      xhr.open = function(method, url, ...rest) {
+        if (/download|unlock|audio|wav|mp3|cdn/i.test(diagnosticUrl(url))) {
+          this.addEventListener('load', () => {
+            const entry = { source: 'Suno page XHR', method, url: diagnosticUrl(url), status: this.status };
+            try {
+              entry.contentType = this.getResponseHeader('content-type');
+              if (/json/i.test(entry.contentType || '')) entry.response = diagnosticShape(this.responseType === 'json' ? this.response : JSON.parse(this.responseText));
+            } catch (_) { /* Binary bodies and inaccessible responses are omitted. */ }
+            recordDiagnostic(entry);
+          }, { once: true });
+        }
+        return open.call(this, method, url, ...rest);
+      };
+    }
+  }
 
   const settings = loadSettings();
 
-  installMetadataBridge();
   window.addEventListener('message', receiveMetadata, false);
+  installMetadataBridge();
+  installDownloadDiagnostics();
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', initialize, { once: true });
@@ -69,19 +287,24 @@
     createPanel();
     scanTracks();
 
-    const observer = new MutationObserver(() => {
-      clearTimeout(runtime.scanTimer);
-      runtime.scanTimer = setTimeout(scanTracks, 500);
+    const observer = new MutationObserver(scheduleScan);
+    observer.observe(document.documentElement, {
+      childList: true, subtree: true, attributes: true,
+      attributeFilter: ['href', 'src', 'class', 'style', 'hidden'],
     });
-    observer.observe(document.documentElement, { childList: true, subtree: true });
+    setInterval(scheduleScan, 2000);
+    window.addEventListener('focus', scheduleScan);
 
     window.addEventListener('popstate', scheduleScan);
     window.addEventListener('hashchange', scheduleScan);
   }
 
   function scheduleScan() {
-    clearTimeout(runtime.scanTimer);
-    runtime.scanTimer = setTimeout(scanTracks, 250);
+    if (runtime.scanTimer !== null) return;
+    runtime.scanTimer = setTimeout(() => {
+      runtime.scanTimer = null;
+      scanTracks();
+    }, 250);
   }
 
   /**
@@ -127,7 +350,7 @@
       return null;
     };
 
-    const collect = (root) => {
+    const collect = (root, requestUrl = '') => {
       const found = [];
       const seen = new WeakSet();
       let visited = 0;
@@ -159,6 +382,11 @@
       };
 
       visit(root, 0);
+      const requestId = String(requestUrl).match(/[0-9a-f-]{36}/i)?.[0];
+      if (idPattern.test(requestId || '')) {
+        const url = cleanUrl(firstString(root, ['wav_url', 'audio_url', 'download_url', 'url']));
+        if (url && /\.wav(?:[?#]|$)/i.test(url)) found.push({ songId: requestId, wav: url });
+      }
       return found;
     };
 
@@ -174,7 +402,7 @@
         try {
           const contentType = response.headers.get('content-type') || '';
           if (/json/i.test(contentType)) {
-            response.clone().json().then((body) => emit(collect(body))).catch(() => {});
+            response.clone().json().then((body) => emit(collect(body, response.url))).catch(() => {});
           }
         } catch (_) {
           // Observation failures must never affect Suno's request.
@@ -191,7 +419,7 @@
           try {
             const contentType = this.getResponseHeader('content-type') || '';
             if (/json/i.test(contentType) && typeof this.responseText === 'string') {
-              emit(collect(JSON.parse(this.responseText)));
+              emit(collect(JSON.parse(this.responseText), this.responseURL));
             }
           } catch (_) {
             // Observation failures must never affect Suno's request.
@@ -235,41 +463,86 @@
     }
   }
 
-  function scanTracks() {
-    if (!runtime.ui) return;
-
-    const signedInHandle = findSignedInHandle();
-    const ownWorkspace = OWNED_WORKSPACE_ROUTES.some((route) => location.pathname.startsWith(route));
-    const byId = new Map();
-    const songLinks = document.querySelectorAll('a[href*="/song/"]');
-
-    for (const link of songLinks) {
-      if (!isRendered(link)) continue;
-      const match = new URL(link.href, location.origin).pathname.match(SONG_PATH_RE);
-      const songId = match?.[1];
-      if (!SONG_ID_RE.test(songId || '')) continue;
-
-      const card = findTrackCard(link);
-      const metadata = trackMetadata.get(songId) || {};
-      const owner = normalizeHandle(findCardOwner(card)) || metadata.owner || (ownWorkspace ? signedInHandle : null);
-      const title = getTrackTitle(link, card) || metadata.title || `untitled-${songId.slice(0, 8)}`;
-      const owned = Boolean(signedInHandle && owner && sameHandle(signedInHandle, owner));
-
-      if (!byId.has(songId)) {
-        byId.set(songId, {
-          songId,
-          title,
-          owner,
-          owned,
-          pageUrl: new URL(`/song/${songId}`, location.origin).href,
-          mp3: metadata.mp3 || null,
-          wav: metadata.wav || null,
-        });
+  // Read song objects attached to rendered React rows. Workspace rows do not
+  // necessarily contain /song/ anchors; the playbar often does.
+  function collectSongObjects(root) {
+    const found = new Map();
+    const seen = new WeakSet();
+    let visited = 0;
+    function visit(value, depth) {
+      if (!value || typeof value !== 'object' || depth > 7 || visited++ > 2500 || seen.has(value)) return;
+      seen.add(value);
+      const songId = value.clip_id || value.song_id || value.id;
+      const mp3 = safeMediaUrl(value.audio_url || value.audioUrl || value.mp3_url);
+      const wav = safeMediaUrl(value.wav_url || value.wavUrl || value.audio_url_wav);
+      const title = value.title || value.metadata?.title;
+      if (SONG_ID_RE.test(songId || '') && (mp3 || wav || (typeof title === 'string' && ('status' in value || 'metadata' in value)))) {
+        found.set(songId, { songId, title, mp3, wav,
+          owner: value.handle || value.user_handle || value.user?.handle || value.creator?.handle });
+      }
+      for (const key of Object.keys(value)) {
+        if (['children', '_owner', 'return', 'stateNode', 'ref'].includes(key)) continue;
+        try { visit(value[key], depth + 1); } catch (_) { /* Ignore inaccessible props. */ }
       }
     }
+    visit(root, 0);
+    return [...found.values()];
+  }
 
-    runtime.tracks = [...byId.values()].filter((track) => track.owned);
+  function discoverRenderedSongs() {
+    const candidates = new Map();
+    const pageDocument = (typeof unsafeWindow === 'object' ? unsafeWindow.document : document);
+    const surface = pageDocument.querySelector('main, [role="main"]') || pageDocument.body;
+    if (!surface) return candidates;
+    for (const element of surface.querySelectorAll('*')) {
+      if (!isRendered(element) || element.closest('#' + APP_ID)) continue;
+      const label = element.getAttribute('aria-label') || '';
+      if (/^Playbar:/i.test(label) || element.closest('[data-testid*="playbar"], [aria-label="Playbar"]')) continue;
+      const props = [];
+      for (const key of Object.keys(element)) {
+        if (key.startsWith('__reactProps$')) props.push(element[key]);
+        if (key.startsWith('__reactFiber$')) {
+          let fiber = element[key];
+          for (let depth = 0; fiber && depth < 6; depth++, fiber = fiber.return) {
+            if (depth > 0 && typeof fiber.type === 'string') break;
+            if (typeof fiber.type !== 'string') props.push(fiber.memoizedProps);
+          }
+        }
+      }
+      for (const value of props) for (const song of collectSongObjects(value)) {
+        mergeMetadata(song);
+        candidates.set(song.songId, { element, song });
+      }
+      const rawId = element.getAttribute('data-song-id') || element.getAttribute('data-clip-id')
+        || element.getAttribute('href')?.match(SONG_PATH_RE)?.[1];
+      if (SONG_ID_RE.test(rawId || '') && !candidates.has(rawId)) {
+        candidates.set(rawId, { element, song: trackMetadata.get(rawId) || { songId: rawId } });
+      }
+    }
+    return candidates;
+  }
+
+  function scanTracks() {
+    if (!runtime.ui) return;
+    const signedInHandle = findSignedInHandle();
+    runtime.signedInHandle = signedInHandle;
+    const ownWorkspace = OWNED_WORKSPACE_ROUTES.some((route) => location.pathname === route || location.pathname.startsWith(route + '/'));
+    const byId = discoverRenderedSongs();
+    runtime.tracks = [];
+    for (const [songId, { element, song }] of byId) {
+      const card = findTrackCard(element);
+      const metadata = trackMetadata.get(songId) || song;
+      const owner = metadata.owner || normalizeHandle(findCardOwner(card)) || (ownWorkspace ? signedInHandle : null);
+      if (!signedInHandle || !owner || !sameHandle(signedInHandle, owner)) continue;
+      runtime.tracks.push({ songId, owner, owned: true,
+        title: metadata.title || getTrackTitle(element, card) || 'untitled-' + songId.slice(0, 8),
+        pageUrl: new URL('/song/' + songId, location.origin).href,
+        mp3: metadata.mp3 || null, wav: metadata.wav || null });
+    }
+    runtime.ui.host.title = 'Last scanned: ' + new Date().toLocaleTimeString();
     renderSummary(signedInHandle, byId.size);
+    renderFindings();
+    renderReport();
   }
 
   function findSignedInHandle() {
@@ -314,7 +587,7 @@
     const text = link.textContent?.trim();
     if (text) return text;
     const label = link.getAttribute('aria-label')?.trim();
-    if (label) return label.replace(/^play\s+/i, '');
+    if (label) return label.replace(/^Playbar:\s*Title for\s*/i, '').replace(/^play\s+/i, '');
     const playButton = card?.querySelector?.('button[aria-label^="Play "]');
     return playButton?.getAttribute('aria-label')?.replace(/^Play\s+/i, '').trim() || null;
   }
@@ -364,7 +637,7 @@
         .foot { margin-top:8px; color:#8e8e98; font-size:11px; }
       </style>
       <section class="panel" aria-label="Suno Workspace Downloader">
-        <div class="title"><span>Suno Downloader</span><span class="badge">loaded tracks</span></div>
+        <div class="title"><span>Suno Downloader 0.3.2</span><span class="badge">loaded tracks</span></div>
         <div class="summary" id="summary">Scanning…</div>
         <div class="format"><label for="format">Format</label><select id="format"><option value="mp3">MP3</option><option value="wav">WAV</option></select></div>
         <div class="controls">
@@ -374,12 +647,22 @@
         <div class="status" id="status">Ready.</div>
         <progress id="progress" value="0" max="1"></progress>
         <details><summary>Results</summary><ol id="results"></ol></details>
-        <div class="foot">Owned tracks only · one download at a time</div>
+        <details><summary>Findings (<span id="findingCount">0</span>)</summary>
+          <p class="status">Why Suno refused each track, in plain terms. A refused asset is never retried, rewritten or renegotiated.</p>
+          <ol id="findings"></ol>
+        </details>
+        <details><summary>Comparison report (no credentials)</summary>
+          <button id="copy">Copy report JSON</button>
+          <textarea id="report" readonly aria-label="Comparison report" style="width:100%;height:170px;box-sizing:border-box;margin-top:6px"></textarea>
+        </details>
+        <details><summary>Raw request log (no credentials)</summary><textarea id="diagnostics" readonly aria-label="Download diagnostics" style="width:100%;height:160px;box-sizing:border-box"></textarea></details>
+        <div class="foot">Owned tracks only · one download at a time · refusals are reported, not retried</div>
       </section>`;
     document.documentElement.appendChild(host);
 
     runtime.ui = {
       host,
+      diagnostics: root.getElementById('diagnostics'),
       summary: root.getElementById('summary'),
       format: root.getElementById('format'),
       rescan: root.getElementById('rescan'),
@@ -389,18 +672,59 @@
       status: root.getElementById('status'),
       progress: root.getElementById('progress'),
       results: root.getElementById('results'),
+      findings: root.getElementById('findings'),
+      findingCount: root.getElementById('findingCount'),
+      report: root.getElementById('report'),
+      copy: root.getElementById('copy'),
     };
 
     runtime.ui.format.value = settings.format === 'wav' ? 'wav' : 'mp3';
     runtime.ui.format.addEventListener('change', () => {
+      runtime.ui.results.replaceChildren();
+      setStatus('Ready for ' + runtime.ui.format.value.toUpperCase() + '.');
       settings.format = runtime.ui.format.value;
       saveSettings();
       scanTracks();
     });
-    runtime.ui.rescan.addEventListener('click', scanTracks);
+    runtime.ui.rescan.addEventListener('click', rescan);
     runtime.ui.start.addEventListener('click', startQueue);
     runtime.ui.cancel.addEventListener('click', cancelQueue);
     runtime.ui.reset.addEventListener('click', resetHistory);
+    runtime.ui.copy.addEventListener('click', copyReport);
+    renderReport();
+  }
+
+  /**
+   * Rescan is explicit and user-driven, and it is the only path that drops
+   * captured media URLs. It re-reads the page the user is looking at; it never
+   * re-requests an asset Suno already refused.
+   */
+  function rescan() {
+    runtime.staleMedia.clear();
+    for (const [songId, metadata] of trackMetadata) trackMetadata.set(songId, { ...metadata, mp3: null, wav: null });
+    scanTracks();
+  }
+
+  function copyReport() {
+    const text = buildReport();
+    runtime.ui.report.value = text;
+    const fallback = () => { runtime.ui.report.select?.(); setStatus('Report ready — press Ctrl+C to copy.'); };
+    try {
+      navigator.clipboard.writeText(text).then(() => setStatus('Comparison report copied.'), fallback);
+    } catch (_) {
+      fallback();
+    }
+  }
+
+  function renderFindings() {
+    if (!runtime.ui?.findings) return;
+    runtime.ui.findingCount.textContent = String(runtime.findings.length);
+    runtime.ui.findings.replaceChildren();
+    for (const finding of runtime.findings.slice(-25)) {
+      addListItem(runtime.ui.findings,
+        `${finding.title} [${String(finding.format).toUpperCase()}] ${FAILURE_CATEGORIES[finding.category]?.label || finding.category}`
+        + `${finding.status ? ' · HTTP ' + finding.status : ''} — ${finding.reason}`, 'error');
+    }
   }
 
   function renderSummary(signedInHandle, totalFound) {
@@ -408,7 +732,7 @@
     const skipped = runtime.tracks.filter((track) => isCompleted(track.songId, format)).length;
     const eligible = runtime.tracks.length - skipped;
     const identity = signedInHandle ? `@${signedInHandle}` : 'signed-in profile not found';
-    runtime.ui.summary.textContent = `${runtime.tracks.length} owned of ${totalFound} loaded · ${eligible} ready · ${skipped} known · ${identity}`;
+    runtime.ui.summary.textContent = `${runtime.tracks.length} owned of ${totalFound} loaded · ${eligible} pending · ${runtime.tracks.filter((track) => track[format]).length} ${format.toUpperCase()} URLs · ${skipped} known · ${identity}`;
     runtime.ui.start.disabled = runtime.running || eligible === 0;
   }
 
@@ -440,6 +764,8 @@
 
     let completed = 0;
     let failed = 0;
+    let consecutiveDenials = 0;
+    let stopReason = null;
 
     for (let index = 0; index < queue.length; index += 1) {
       const track = queue[index];
@@ -449,7 +775,8 @@
       const url = await resolveMediaUrl(track, format);
       if (!url) {
         failed += 1;
-        addResult(`${track.title}: ${format.toUpperCase()} is unavailable`, 'error');
+        recordFinding(track, format, 'missing_asset', new Error('No media URL exposed for this format'));
+        addResult(`${track.title}: no ${format.toUpperCase()} asset exposed — ${FAILURE_CATEGORIES.missing_asset.advice}`, 'error');
         runtime.ui.progress.value = index + 1;
         continue;
       }
@@ -458,14 +785,33 @@
       const filename = `Suno/${makeFilename(track.title, track.songId, format)}`;
 
       try {
-        await downloadWithRetries(url, filename);
+        await downloadWithRetries(url, filename, format, track.songId);
         markCompleted(track.songId, format);
+        runtime.staleMedia.delete(track.songId);
         completed += 1;
+        consecutiveDenials = 0;
         addResult(`${track.title}: downloaded`, 'ok');
       } catch (error) {
         if (runtime.cancelled || error?.name === 'AbortError') break;
+        const category = classifyFailure(error);
+        const info = recordFinding(track, format, category, error);
         failed += 1;
-        addResult(`${track.title}: ${error?.message || 'download failed'}`, 'error');
+        addResult(`${track.title}: ${info.label}`
+          + `${error?.status ? ' · HTTP ' + error.status : ''} — ${info.advice}`, 'error');
+
+        if (category === 'session_invalid') {
+          stopReason = 'Stopped: Suno rejected this tab’s session (HTTP 401). Sign in again, then rescan.';
+          break;
+        }
+        if (category === 'not_entitled' || category === 'expired_url') {
+          consecutiveDenials += 1;
+          if (consecutiveDenials >= MAX_CONSECUTIVE_DENIALS) {
+            stopReason = `Stopped after ${consecutiveDenials} consecutive refusals. Suno is not serving these assets to this account right now; the remaining tracks were left untouched.`;
+            break;
+          }
+        } else {
+          consecutiveDenials = 0;
+        }
       }
 
       runtime.ui.progress.value = index + 1;
@@ -475,14 +821,20 @@
     runtime.activeDownload = null;
     runtime.running = false;
     setControlsRunning(false);
+    renderFindings();
     scanTracks();
 
-    if (runtime.cancelled) setStatus(`Cancelled · ${completed} downloaded · ${failed} failed`);
+    if (stopReason) setStatus(stopReason);
+    else if (runtime.cancelled) setStatus(`Cancelled · ${completed} downloaded · ${failed} failed`);
     else setStatus(`Finished · ${completed} downloaded · ${failed} failed`);
   }
 
   async function resolveMediaUrl(track, format) {
-    const cached = trackMetadata.get(track.songId)?.[format] || track[format];
+    // A refused URL is dropped from cache, so the next user-initiated run asks
+    // the page for the asset again instead of replaying the stale capture.
+    const cached = runtime.staleMedia.has(track.songId)
+      ? null
+      : (trackMetadata.get(track.songId)?.[format] || track[format]);
     if (cached) return safeMediaUrl(cached);
 
     try {
@@ -492,7 +844,9 @@
       const html = await response.text();
       const extracted = extractMetadataFromSongHtml(html, track.songId);
       if (extracted) mergeMetadata(extracted);
-      return trackMetadata.get(track.songId)?.[format] || null;
+      const resolved = trackMetadata.get(track.songId)?.[format] || null;
+      if (resolved) runtime.staleMedia.delete(track.songId);
+      return resolved;
     } catch (_) {
       return null;
     }
@@ -504,28 +858,119 @@
       .replaceAll('\\/', '/')
       .replaceAll('&amp;', '&');
     const urls = decoded.match(/https:\/\/[^"'<>\\\s]+/g) || [];
-    const mp3 = urls.find((url) => /\.mp3(?:[?#]|$)/i.test(url));
-    const wav = urls.find((url) => /\.wav(?:[?#]|$)/i.test(url));
+    const belongsToSong = (url) => safeMediaUrl(url) && url.toLowerCase().includes(songId.toLowerCase());
+    const mp3 = urls.find((url) => belongsToSong(url) && /\.mp3(?:[?#]|$)/i.test(url));
+    const wav = urls.find((url) => belongsToSong(url) && /\.wav(?:[?#]|$)/i.test(url));
     const title = decoded.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)/i)?.[1]
       || decoded.match(/<title>([^<]+)/i)?.[1]
       || null;
     return { songId, title, mp3, wav };
   }
 
-  async function downloadWithRetries(url, name) {
+  async function downloadWithRetries(url, name, format, songId) {
     let lastError;
     for (let attempt = 0; attempt < RETRY_DELAYS_MS.length; attempt += 1) {
       if (runtime.cancelled) throw abortError();
       if (RETRY_DELAYS_MS[attempt]) await delay(RETRY_DELAYS_MS[attempt]);
       try {
-        await downloadOnce(url, name);
+        const blob = await fetchAudio(url, format, songId);
+        if (runtime.cancelled) throw abortError();
+        const objectUrl = URL.createObjectURL(blob);
+        try {
+          await downloadOnce(objectUrl, name);
+        } finally {
+          URL.revokeObjectURL(objectUrl);
+        }
         return;
       } catch (error) {
         lastError = error;
+        if (!error.songId) error.songId = songId;
         if (runtime.cancelled || error?.name === 'AbortError') throw error;
+        // HTTP 401/403 is an authorization decision. Repeating the identical
+        // request cannot legitimately change it, so it is never retried, never
+        // rewritten, and never falls back to another format.
+        if ([401, 403].includes(error?.status)) throw error;
+        // HTTP 429 is a throttle rather than a denial: back off, then take the
+        // bounded retry.
+        if (error?.status === 429 && error.retryAfter) await delay(error.retryAfter);
       }
     }
     throw lastError || new Error('download failed');
+  }
+
+
+  function validateAudio(buffer, format, contentType = '') {
+    const bytes = new Uint8Array(buffer);
+    if (/text\/|json|xml|mpegurl/i.test(contentType)) {
+      throw new Error('Server returned a page or playlist instead of audio; no file saved');
+    }
+    if (bytes.length < 16384) throw new Error('Audio response is too small; no file saved');
+    const ascii = (start, length) => String.fromCharCode(...bytes.subarray(start, start + length));
+    if (format === 'wav') {
+      if (!['RIFF', 'RF64'].includes(ascii(0, 4)) || ascii(8, 4) !== 'WAVE') {
+        throw new Error('Response is not WAV audio; no file saved');
+      }
+    } else {
+      let offset = 0;
+      if (ascii(0, 3) === 'ID3') {
+        offset = 10 + ((bytes[6] & 127) * 2097152 + (bytes[7] & 127) * 16384
+          + (bytes[8] & 127) * 128 + (bytes[9] & 127));
+        if (bytes[5] & 16) offset += 10;
+      }
+      let frame = false;
+      for (let i = offset; i < Math.min(bytes.length - 3, offset + 4096); i += 1) {
+        if (bytes[i] === 255 && (bytes[i + 1] & 224) === 224
+          && (bytes[i + 1] & 24) !== 8 && (bytes[i + 1] & 6) === 2
+          && (bytes[i + 2] & 240) !== 0 && (bytes[i + 2] & 240) !== 240
+          && (bytes[i + 2] & 12) !== 12) { frame = true; break; }
+      }
+      if (!frame) throw new Error('Response contains no MP3 audio frame; no file saved');
+    }
+  }
+
+  function parseRetryAfter(headers) {
+    const seconds = Number(String(headers || '').match(/^retry-after:\s*(\d+)/im)?.[1]);
+    return Number.isFinite(seconds) && seconds > 0 ? Math.min(seconds * 1000, 30000) : 0;
+  }
+
+  function fetchAudio(url, format, songId) {
+    return new Promise((resolve, reject) => {
+      if (runtime.cancelled) { reject(abortError()); return; }
+      runtime.activeDownload = GM_xmlhttpRequest({
+        method: 'GET', url, responseType: 'arraybuffer', timeout: 180000,
+        onload: (response) => {
+          recordDiagnostic({ source: 'Scraper background request', method: 'GET', url: diagnosticUrl(url), status: response.status,
+            contentType: response.responseHeaders?.match(/^content-type:\s*([^\r\n]+)/im)?.[1] || '', bytes: response.response?.byteLength || 0 });
+          runtime.activeDownload = null;
+          try {
+            if (runtime.cancelled) throw abortError();
+            if (response.status !== 200) {
+              const error = new Error('Audio request failed: HTTP ' + response.status);
+              error.status = response.status;
+              error.songId = songId;
+              error.retryAfter = parseRetryAfter(response.responseHeaders);
+              throw error;
+            }
+            if (!safeMediaUrl(response.finalUrl || url)) {
+              const redirect = new Error('Unexpected audio redirect');
+              redirect.songId = songId;
+              throw redirect;
+            }
+            const contentType = response.responseHeaders?.match(/^content-type:\s*([^\r\n]+)/im)?.[1] || '';
+            try {
+              validateAudio(response.response, format, contentType);
+            } catch (invalid) {
+              invalid.songId = songId;
+              throw invalid;
+            }
+            resolve(new Blob([response.response], { type: format === 'wav' ? 'audio/wav' : 'audio/mpeg' }));
+          } catch (error) { reject(error); }
+        },
+        onerror: () => { runtime.activeDownload = null; reject(new Error('Audio request failed')); },
+        ontimeout: () => { runtime.activeDownload = null; reject(new Error('Audio request timed out')); },
+        onabort: () => { runtime.activeDownload = null; reject(abortError()); },
+      });
+    });
   }
 
   function downloadOnce(url, name) {
@@ -543,6 +988,10 @@
           onerror: (details) => {
             runtime.activeDownload = null;
             reject(new Error(details?.error || 'download failed'));
+          },
+          onabort: () => {
+            runtime.activeDownload = null;
+            reject(abortError());
           },
           ontimeout: () => {
             runtime.activeDownload = null;
@@ -570,7 +1019,12 @@
   function resetHistory() {
     settings.completed = {};
     saveSettings();
-    addResult('Download history cleared.', 'skip');
+    runtime.findings = [];
+    runtime.staleMedia.clear();
+    runtime.ui.results.replaceChildren();
+    renderFindings();
+    renderReport();
+    setStatus('Download history cleared. Ready for ' + runtime.ui.format.value.toUpperCase() + '.');
     scanTracks();
   }
 
@@ -606,11 +1060,15 @@
     runtime.ui.status.textContent = message;
   }
 
-  function addResult(message, className) {
+  function addListItem(list, message, className) {
     const item = document.createElement('li');
     item.textContent = message;
     item.className = className;
-    runtime.ui.results.appendChild(item);
+    list.appendChild(item);
+  }
+
+  function addResult(message, className) {
+    addListItem(runtime.ui.results, message, className);
   }
 
   function abortError() {
